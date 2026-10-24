@@ -211,6 +211,10 @@
   .sk{height:150px; border-radius:16px; background:linear-gradient(90deg,#ece9f5 25%,#f6f4fb 50%,#ece9f5 75%); background-size:200% 100%; animation:sk 1.2s infinite linear;}
   @keyframes sk{from{background-position:200% 0;} to{background-position:-200% 0;}}
   @media (prefers-reduced-motion: reduce){ .sk{animation:none;} }
+  .mc-loading{display:flex; align-items:center; justify-content:center; gap:10px; min-height:120px; color:#6b7280; font-size:13px; background:#f8f7fc;}
+  .mc-spin{width:18px; height:18px; border:3px solid var(--main-light); border-top-color:var(--main); border-radius:50%; animation:mcspin .8s linear infinite;}
+  @keyframes mcspin{to{transform:rotate(360deg);}}
+  @media (prefers-reduced-motion: reduce){ .mc-spin{animation:none;} }
 </style>
 </head>
 <body>
@@ -834,29 +838,33 @@ function buildEncyclopedia(){
 
 let openSensorName = null;
 
+/* 블록 그림 상태: 그림 있음 → 그림 / 불러오는 중 → 로딩 상자 / 실패(인터넷 없음 등) → 글자 코드 */
+let MC_FAILED = false;
+function blockBody(item, alt){
+  if(item._blocks) return `<div class="blockbox"><img src="${item._blocks.uri}" width="${item._blocks.width}" height="${item._blocks.height}" alt="${alt}"></div>`;
+  if(MC_FAILED || item._failed || !item.makecode) return `<div class="codebox">${item.code}</div>`;
+  return `<div class="blockbox mc-loading"><span class="mc-spin"></span>블록 그림을 불러오는 중이에요…</div>`;
+}
 function blockExampleHtml(s){
   const title = s.exampleTitle ? `: ${s.exampleTitle}` : "";
   const desc = s.exampleDesc ? `<p class="example-desc">${s.exampleDesc}</p>` : "";
-  const body = s._blocks
-    ? `<div class="blockbox"><img src="${s._blocks.uri}" width="${s._blocks.width}" height="${s._blocks.height}" alt="MakeCode 블록 예시"></div>`
-    : `<div class="codebox">${s.code}</div>`;
+  const body = blockBody(s, "MakeCode 블록 예시");
   return `<div id="mc-example"><h4>💻 블록 예시${title} (MakeCode)</h4>${desc}${body}</div>`;
 }
 
 function checkHtml(name){
   const c = VALUE_CHECK[name]; if(!c) return "";
-  const body = c._blocks
-    ? `<div class="blockbox"><img src="${c._blocks.uri}" width="${c._blocks.width}" height="${c._blocks.height}" alt="값 확인 블록"></div>`
-    : `<div class="codebox">${c.code}</div>`;
+  const body = blockBody(c, "값 확인 블록");
   return `<div id="mc-check"><h4>🔎 먼저 값 확인하기</h4>
     <p class="example-desc">기준값(예: 300)을 정하기 전에 실제 값을 확인해요. LED에 숫자가 나오고, MakeCode 시뮬레이터 아래 <b>데이터 보기 장치</b>에서 그래프로도 볼 수 있어요.</p>${body}<button class="go-rec" onclick="goRecord(openSensorName)">📊 확인한 값을 기록부에 저장하러 가기</button></div>`;
 }
 
 function applyBlocksToModal(){
-  const s = SENSORS[openSensorName];
-  if(!s || !s._blocks) return;
+  const s = SENSORS[openSensorName]; if(!s) return;
   const el = document.getElementById("mc-example");
   if(el) el.outerHTML = blockExampleHtml(s);
+  const ck = document.getElementById("mc-check");
+  if(ck) ck.outerHTML = checkHtml(openSensorName);
 }
 
 function openModal(name){
@@ -1010,8 +1018,30 @@ function askErr(){
    인터넷에 연결되지 않으면 글자 예시(code)가 그대로 보여요. */
 const MAKECODE_URL = "https://makecode.microbit.org/";
 
+/* 한 번 그린 블록 그림은 이 기기에 저장해 두고, 다음부터는 바로 보여 줘요 (코드가 바뀌면 다시 그림) */
+const MC_CACHE_KEY = "mc-blocks-v1";
+let MC_CACHE = {};
+function mcItems(){
+  const list = [];
+  Object.entries(SENSORS).forEach(([name,s])=>{ if(s.makecode) list.push([name, s, s.makecodePackage]); });
+  Object.entries(VALUE_CHECK).forEach(([name,c])=>list.push([name+"|check", c, c.pkg]));
+  return list;
+}
+function mcSave(id, item, b){
+  MC_CACHE[id] = { code:item.makecode, ...b };
+  try{ localStorage.setItem(MC_CACHE_KEY, JSON.stringify(MC_CACHE)); }catch(e){}
+}
 function initMakeCode(){
-  if(!Object.values(SENSORS).some(s=>s.makecode)) return;
+  try{ MC_CACHE = JSON.parse(localStorage.getItem(MC_CACHE_KEY) || "{}") || {}; }catch(e){ MC_CACHE = {}; }
+  let missing = 0;
+  mcItems().forEach(([id,item])=>{
+    const c = MC_CACHE[id];
+    if(c && c.code === item.makecode && c.uri) item._blocks = { uri:c.uri, width:c.width, height:c.height };
+    else missing++;
+  });
+  if(!missing) return;   // 모두 저장돼 있으면 MakeCode에 접속하지 않아요
+  /* 15초 안에 그림이 안 오면(인터넷 끊김·차단) 글자 코드로 보여 줘요 */
+  setTimeout(()=>{ if(mcItems().some(([,it])=>!it._blocks)){ MC_FAILED = true; applyBlocksToModal(); } }, 15000);
   const f = document.createElement("iframe");
   f.id = "makecoderenderer";
   f.style.cssText = "position:absolute;left:0;bottom:0;width:1px;height:1px;border:0;";
@@ -1025,26 +1055,23 @@ window.addEventListener("message", function(ev){
   if(msg.type === "renderready"){
     const f = document.getElementById("makecoderenderer");
     if(!f || !f.contentWindow) return;
-    Object.entries(SENSORS).forEach(([name,s])=>{
-      if(s.makecode) f.contentWindow.postMessage(
-        { type:"renderblocks", id:name, code:s.makecode,
-          options: s.makecodePackage ? { package:"extension="+s.makecodePackage } : {} },
-        MAKECODE_URL);
-    });
-    Object.entries(VALUE_CHECK).forEach(([name,c])=>{
+    mcItems().forEach(([id,item,pkg])=>{
+      if(item._blocks) return;
       f.contentWindow.postMessage(
-        { type:"renderblocks", id:name+"|check", code:c.makecode,
-          options: c.pkg ? { package:"extension="+c.pkg } : {} },
+        { type:"renderblocks", id:id, code:item.makecode,
+          options: pkg ? { package:"extension="+pkg } : {} },
         MAKECODE_URL);
     });
-  }else if(msg.type === "renderblocks" && typeof msg.id === "string" && msg.id.endsWith("|check")){
-    const name = msg.id.slice(0,-6);
-    if(!VALUE_CHECK[name]) return;
-    VALUE_CHECK[name]._blocks = { uri:msg.uri, width:msg.width, height:msg.height };
-    if(openSensorName === name){ const el = document.getElementById("mc-check"); if(el) el.outerHTML = checkHtml(name); }
-  }else if(msg.type === "renderblocks" && SENSORS[msg.id]){
-    SENSORS[msg.id]._blocks = { uri:msg.uri, width:msg.width, height:msg.height };
-    if(openSensorName === msg.id) applyBlocksToModal();
+  }else if(msg.type === "renderblocks" && typeof msg.id === "string"){
+    const isCheck = msg.id.endsWith("|check");
+    const name = isCheck ? msg.id.slice(0,-6) : msg.id;
+    const item = isCheck ? VALUE_CHECK[name] : SENSORS[name];
+    if(!item) return;
+    if(msg.uri){
+      item._blocks = { uri:msg.uri, width:msg.width, height:msg.height };
+      mcSave(msg.id, item, item._blocks);
+    }else item._failed = true;   // 그리기 실패 → 글자 코드
+    if(openSensorName === name) applyBlocksToModal();
   }
 });
 
